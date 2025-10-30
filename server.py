@@ -5,13 +5,32 @@ from transformers import pipeline
 import uvicorn
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import torch
+import threading
 
 app = FastAPI()
-chat_pipe = pipeline("text-generation", model="Qwen/Qwen2.5-0.5B-Instruct")
-summary_pipe = pipeline("summarization", model="Falconsai/text_summarization")
 
-# Thread pool for running model inference in background
-executor = ThreadPoolExecutor(max_workers=4)
+# Detect MPS (Metal Performance Shaders) for M4 Mac GPU acceleration
+if torch.backends.mps.is_available():
+    device = "mps"
+    print("✓ Using MPS (GPU) acceleration on M4 Mac")
+else:
+    device = "cpu"
+    print("⚠ MPS not available, using CPU")
+
+# Initialize pipelines with GPU acceleration
+chat_pipe = pipeline("text-generation", model="Qwen/Qwen2.5-0.5B-Instruct", device=device)
+summary_pipe = pipeline("summarization", model="Falconsai/text_summarization", device=device)
+
+# Thread pool for running model inference in background (increased for 20 concurrent users)
+executor = ThreadPoolExecutor(max_workers=20)
+
+# Lock for MPS GPU access (MPS doesn't handle concurrent access well)
+# This serializes GPU operations while still accepting 20 concurrent connections
+mps_lock = threading.Lock()
+
+# Semaphore to limit queued requests (prevents memory overload)
+semaphore = asyncio.Semaphore(20)
 
 class ChatRequest(BaseModel):
     text: str
@@ -81,24 +100,28 @@ def home():
     """
 
 def run_chat(text: str):
-    out = chat_pipe(text, max_new_tokens=100, return_full_text=False)
-    return out[0]["generated_text"]
+    with mps_lock:  # Serialize GPU access
+        out = chat_pipe(text, max_new_tokens=100, return_full_text=False)
+        return out[0]["generated_text"]
 
 def run_summarize(text: str):
-    out = summary_pipe(text, max_length=130, min_length=30, do_sample=False)
-    return out[0]["summary_text"]
+    with mps_lock:  # Serialize GPU access
+        out = summary_pipe(text, max_length=130, min_length=30, do_sample=False)
+        return out[0]["summary_text"]
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, run_chat, req.text)
-    return {"response": result}
+    async with semaphore:  # Limit to 20 concurrent requests
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(executor, run_chat, req.text)
+        return {"response": result}
 
 @app.post("/summarize")
 async def summarize(req: SummaryRequest):
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, run_summarize, req.text)
-    return {"summary": result}
+    async with semaphore:  # Limit to 20 concurrent requests
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(executor, run_summarize, req.text)
+        return {"summary": result}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
